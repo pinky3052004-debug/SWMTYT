@@ -19,8 +19,12 @@ on:
         description: "Upload to YouTube?"
         type: boolean
         default: true
+      publish_at:
+        description: "Scheduled publish time, Myanmar time HH:MM (empty = publish now with the privacy below)"
+        type: string
+        default: "18:41"
       privacy:
-        description: "YouTube privacy"
+        description: "YouTube privacy (only used when publish_at is empty)"
         type: choice
         options: [private, unlisted, public]
         default: private
@@ -103,4 +107,5 @@ jobs:
           python scripts/upload.py \
             --video "out/pomodoro_${PRESET}.mp4" \
             --metadata-dir out/meta \
-            --privacy "${{ inputs.privacy || 'private' }}"
+            --privacy "${{ inputs.privacy || 'private' }}" \
+            --publish-at "${{ inputs.publish_at }}"
