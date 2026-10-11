@@ -26,7 +26,8 @@ creds = Credentials(
     client_id=os.environ["YT_CLIENT_ID"],
     client_secret=os.environ["YT_CLIENT_SECRET"],
     token_uri="https://oauth2.googleapis.com/token",
-    scopes=["https://www.googleapis.com/auth/youtube.upload"],
+    # no `scopes=` on purpose: refresh with the scopes the token was originally granted
+    # (requesting a different scope causes "invalid_scope: Bad Request")
 )
 yt = build("youtube", "v3", credentials=creds)
 body = {
