@@ -1,0 +1,106 @@
+name: Daily Pomodoro video
+
+# Triggered by cron-job.org (POST .../dispatches) once per day.
+# preset=random -> picks ONE of 50/10, 25/5, 30/5, 45/10 at random.
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "auto = follow the daily rotation"
+        type: choice
+        options: [auto, "25-5", "50-10", "30-10", "45-10"]
+        default: auto
+      theme:
+        description: "auto = follow the daily rotation"
+        type: choice
+        options: [auto, sage, sky, apricot, mauve]
+        default: auto
+      upload:
+        description: "Upload to YouTube?"
+        type: boolean
+        default: true
+      privacy:
+        description: "YouTube privacy"
+        type: choice
+        options: [private, unlisted, public]
+        default: private
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Pick preset + colour (daily rotation)
+        run: |
+          # Rotation: 1 video per day.
+          #   day 0-3  : sage    -> 25/5, 50/10, 30/10, 45/10
+          #   day 4-7  : sky     -> 25/5, 50/10, 30/10, 45/10
+          #   day 8-11 : apricot -> ...
+          #   day 12-15: mauve   -> ...   then back to sage
+          START="${{ vars.START_DATE }}"; START="${START:-2026-10-12}"
+          TODAY=$(TZ=Asia/Yangon date +%F)
+          N=$(( ( $(date -u -d "$TODAY" +%s) - $(date -u -d "$START" +%s) ) / 86400 ))
+          [ "$N" -lt 0 ] && N=0
+          PRESETS=(25-5 50-10 30-10 45-10)
+          THEMES=(sage sky apricot mauve)
+          P="${{ inputs.preset }}"; T="${{ inputs.theme }}"
+          if [ -z "$P" ] || [ "$P" = "auto" ]; then P=${PRESETS[$((N % 4))]}; fi
+          if [ -z "$T" ] || [ "$T" = "auto" ]; then T=${THEMES[$(((N / 4) % 4))]}; fi
+          case "$P" in
+            25-5)  F=25; B=5;  C=4 ;;   # 2 h
+            50-10) F=50; B=10; C=4 ;;   # 4 h
+            30-10) F=30; B=10; C=3 ;;   # 2 h
+            45-10) F=45; B=10; C=4 ;;   # 3 h 40 min
+          esac
+          case "$T" in
+            sage) NAME="Soft Sage" ;; sky) NAME="Soft Sky" ;;
+            apricot) NAME="Soft Apricot" ;; mauve) NAME="Soft Mauve" ;;
+          esac
+          {
+            echo "PRESET=$P"; echo "FOCUS=$F"; echo "BREAK=$B"; echo "CYCLES=$C"; echo "THEME=$T"
+          } >> "$GITHUB_ENV"
+          echo "Day #$N -> preset $P, colour $T"
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg fonts-lato
+          pip install pillow google-api-python-client google-auth
+
+      - name: Generate video + chapters
+        run: |
+          python scripts/generate.py \
+            --focus "$FOCUS" --break "$BREAK" --cycles "$CYCLES" --theme "$THEME" \
+            --out "out/pomodoro_${PRESET}.mp4"
+          echo "---- chapters ----"
+          cat "out/pomodoro_${PRESET}_chapters.txt"
+
+      - name: Build title / description / tags
+        run: |
+          python scripts/metadata.py --focus "$FOCUS" --break "$BREAK" --cycles "$CYCLES" \
+            --theme "$THEME" --outdir out/meta
+          echo "---- description ----"; cat out/meta/description.txt
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pomodoro-${{ env.PRESET }}
+          path: out/
+          retention-days: 7
+
+      - name: Upload to YouTube
+        if: ${{ inputs.upload == true || inputs.upload == 'true' }}
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        run: |
+          python scripts/upload.py \
+            --video "out/pomodoro_${PRESET}.mp4" \
+            --metadata-dir out/meta \
+            --privacy "${{ inputs.privacy || 'private' }}"
