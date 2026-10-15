@@ -9,8 +9,11 @@ import argparse
 import math
 import os
 import random
+import re
+import shutil
 import subprocess
 import sys
+import tempfile
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont
 
@@ -155,33 +158,130 @@ def draw_icon(img, kind, cx, cy, color, scale=1.2):
     img.paste(layer, (cx - int(center[0] * scale), cy - int(center[1] * scale)), layer)
 
 
-def make_countdown_wav(path, intro=INTRO_SECONDS):
-    """Soft tick for each countdown second (7..1) + a bell-like 'start' chime when the countdown ends."""
+AUDIO_EXT = (".mp3", ".wav", ".m4a", ".aac", ".ogg", ".opus", ".flac")
+
+
+def _natural_key(name):
+    return [int(t) if t.isdigit() else t.lower() for t in re.split(r"(\d+)", name)]
+
+
+def find_music(path):
+    """Every audio file in the folder (1.mp3, 2.mp3, ... in natural order), or the single file given."""
+    if os.path.isfile(path):
+        return [path]
+    if os.path.isdir(path):
+        files = [os.path.join(path, f) for f in os.listdir(path) if f.lower().endswith(AUDIO_EXT)]
+        return sorted(files, key=lambda p: _natural_key(os.path.basename(p)))
+    return []
+
+
+def write_wav(path, length, notes):
+    """notes = [(start_sec, freq_hz, dur_sec, amplitude, decay)] -> soft bell/tick sounds."""
     import array
     import wave
     sr = 44100
-    n = int((intro + 2.0) * sr)
+    n = int(length * sr)
     buf = [0.0] * n
-
-    def add(t0, freq, dur, amp, decay):
+    for t0, freq, dur, amp, decay in notes:
         i0 = int(t0 * sr)
         for i in range(int(dur * sr)):
             if i0 + i >= n:
                 break
             t = i / sr
-            env = math.exp(-decay * t) * min(1.0, i / (0.004 * sr))   # fast attack, soft decay
+            env = math.exp(-decay * t) * min(1.0, i / (0.004 * sr))
             buf[i0 + i] += amp * env * math.sin(2 * math.pi * freq * t)
-
-    for k in range(intro):                       # one tick per displayed number
-        add(k, 880.0 if k < intro - 1 else 1174.7, 0.22, 0.32, 22)
-    for f, a in ((1046.5, 0.28), (1318.5, 0.22), (1568.0, 0.16)):   # start chime
-        add(intro, f, 1.8, a, 3.2)
     pcm = array.array("h", (int(max(-1, min(1, v)) * 32000) for v in buf for _ in (0, 1)))
     with wave.open(path, "wb") as w:
         w.setnchannels(2)
         w.setsampwidth(2)
         w.setframerate(sr)
         w.writeframes(pcm.tobytes())
+
+
+def _ticks(n, high_last=False):
+    return [(k, 1174.7 if (high_last and k == n - 1) else 880.0, 0.22, 0.32, 22) for k in range(n)]
+
+
+def _bells(t0, freqs, gap, amp, dur=2.0, decay=3.0):
+    return [(t0 + i * gap, f, dur, amp, decay) for i, f in enumerate(freqs)]
+
+
+def make_sound_clips(tmp):
+    """countdown.wav  : 7 ticks + start chime (video start)
+    to_break.wav   : 3 ticks, then a soft DESCENDING chime  -> 'break time'
+    to_focus.wav   : 3 ticks, then a bright ASCENDING chime -> 'back to focus'
+    The two section clips start 3 s BEFORE the change, so the chime lands exactly on it."""
+    cd = os.path.join(tmp, "countdown.wav")
+    start = [(INTRO_SECONDS, f, 1.8, a, 3.2) for f, a in ((1046.5, 0.28), (1318.5, 0.22), (1568.0, 0.16))]
+    write_wav(cd, INTRO_SECONDS + 2.5, _ticks(INTRO_SECONDS, True) + start)
+    tb = os.path.join(tmp, "to_break.wav")
+    write_wav(tb, 10.0, _ticks(3) + _bells(3.0, [1174.7, 987.8, 784.0, 587.3], 0.30, 0.30)
+              + _bells(5.2, [1174.7, 987.8, 784.0, 587.3], 0.30, 0.20))
+    tf = os.path.join(tmp, "to_focus.wav")
+    write_wav(tf, 10.0, _ticks(3) + _bells(3.0, [587.3, 784.0, 987.8, 1174.7], 0.22, 0.32)
+              + _bells(5.0, [587.3, 784.0, 987.8, 1174.7], 0.22, 0.22))
+    return cd, tb, tf
+
+
+def _duration(path):
+    r = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    try:
+        return float(r.stdout.strip())
+    except ValueError:
+        return 0.0
+
+
+def prepare_music(files, total_sec, tmp):
+    """Convert every file to the same format (44.1k stereo, evened-out loudness), then build a
+    concat list that repeats the playlist until the whole video is covered."""
+    prepared = []
+    for i, f in enumerate(files):
+        out = os.path.join(tmp, f"m{i:03d}.mp3")
+        r = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", f, "-vn", "-map_metadata", "-1",
+                            "-ar", "44100", "-ac", "2", "-af", "loudnorm=I=-22:TP=-2:LRA=11",
+                            "-b:a", "192k", out])
+        if r.returncode == 0:
+            prepared.append(out)
+        else:
+            print(f"WARNING: could not read {f} - skipped", file=sys.stderr)
+    if not prepared:
+        return None
+    playlist = sum(_duration(p) for p in prepared)
+    reps = max(1, math.ceil((total_sec + 60) / max(playlist, 1.0)))
+    lst = os.path.join(tmp, "playlist.txt")
+    with open(lst, "w") as fh:
+        for _ in range(reps):
+            for p in prepared:
+                fh.write(f"file '{p}'\n")
+    print(f"Music: {len(prepared)} file(s), playlist {playlist / 60:.1f} min, repeated x{reps}")
+    return lst
+
+
+def build_audio_filter(tb_times, tf_times, has_music):
+    parts, labels = ["[1:a]anull[cd]"], ["cd"]
+
+    def add(idx, times, tag):
+        if not times:
+            return
+        if len(times) == 1:
+            parts.append(f"[{idx}:a]anull[{tag}s0]")
+        else:
+            parts.append(f"[{idx}:a]asplit={len(times)}" + "".join(f"[{tag}s{i}]" for i in range(len(times))))
+        for i, tm in enumerate(times):
+            ms = max(0, int((tm - 3) * 1000))       # clip starts 3 s before the change
+            parts.append(f"[{tag}s{i}]adelay={ms}|{ms}[{tag}d{i}]")
+            labels.append(f"{tag}d{i}")
+
+    add(2, tb_times, "tb")
+    add(3, tf_times, "tf")
+    if has_music:   # Lofi starts exactly when the countdown ends, fading in
+        ms = INTRO_SECONDS * 1000
+        parts.append(f"[4:a]afade=t=in:st=0:d=4,adelay={ms}|{ms}[m]")
+        labels.append("m")
+    parts.append("".join(f"[{l}]" for l in labels)
+                 + f"amix=inputs={len(labels)}:duration=longest:normalize=0,apad,alimiter=limit=0.95[a]")
+    return ";".join(parts)
 
 
 def tracked(d, cx, cy, text, fnt, fill, tracking=8, anchor_x="center"):
@@ -323,7 +423,7 @@ def main():
     ap.add_argument("--break", dest="brk", type=float, required=True, help="break minutes")
     ap.add_argument("--cycles", type=int, default=3)
     ap.add_argument("--theme", default="sage", choices=list(THEMES))
-    ap.add_argument("--music", default="assets/music.mp3")
+    ap.add_argument("--music", default="assets", help="folder with mp3 files (or one file)")
     ap.add_argument("--out", required=True)
     a = ap.parse_args()
 
@@ -339,20 +439,25 @@ def main():
     print(f"Total length: {chapter_ts(t)}")
     total_all = t
 
-    wav_path = os.path.splitext(a.out)[0] + "_countdown.wav"
-    make_countdown_wav(wav_path)
+    tmp = tempfile.mkdtemp()
+    cd_wav, tb_wav, tf_wav = make_sound_clips(tmp)
+    tb_times, tf_times, tt = [], [], INTRO_SECONDS
+    for _ in range(a.cycles):
+        tt += focus_s
+        tb_times.append(tt)          # focus ends -> break starts
+        tt += break_s
+        tf_times.append(tt)          # break ends -> next focus starts (last one = video end: ticks only)
+    files = find_music(a.music)
+    playlist = prepare_music(files, t, tmp) if files else None
+    if not playlist:
+        print(f"No music found in '{a.music}' -> countdown + section sounds only")
     cmd = ["ffmpeg", "-y", "-loglevel", "error",
            "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{W}x{H}", "-framerate", "1", "-i", "-",
-           "-i", wav_path]
-    if os.path.exists(a.music):
-        # countdown sounds first, Lofi fades in right when the countdown ends
-        cmd += ["-stream_loop", "-1", "-i", a.music, "-filter_complex",
-                f"[2:a]afade=t=in:st=0:d=4,adelay={INTRO_SECONDS * 1000}|{INTRO_SECONDS * 1000}[m];"
-                "[1:a][m]amix=inputs=2:duration=longest:normalize=0,alimiter=limit=0.95[a]"]
-    else:
-        print("No music file found -> countdown sound only")
-        cmd += ["-filter_complex", "[1:a]apad[a]"]
-    cmd += ["-map", "0:v", "-map", "[a]", "-r", "30", "-c:v", "libx264", "-preset", "veryfast",
+           "-i", cd_wav, "-i", tb_wav, "-i", tf_wav]
+    if playlist:
+        cmd += ["-f", "concat", "-safe", "0", "-i", playlist]
+    cmd += ["-filter_complex", build_audio_filter(tb_times, tf_times, bool(playlist)),
+            "-map", "0:v", "-map", "[a]", "-r", "30", "-c:v", "libx264", "-preset", "veryfast",
             "-tune", "stillimage", "-crf", "20", "-pix_fmt", "yuv420p", "-g", "60",
             "-c:a", "aac", "-b:a", "192k", "-t", str(t), "-movflags", "+faststart", a.out]
     p = subprocess.Popen(cmd, stdin=subprocess.PIPE)
@@ -372,7 +477,7 @@ def main():
         print(f"session {c}/{a.cycles} rendered", file=sys.stderr)
     p.stdin.close()
     p.wait()
-    os.remove(wav_path)
+    shutil.rmtree(tmp, ignore_errors=True)
     print("Saved", a.out, "and", chapters_path)
 
 
