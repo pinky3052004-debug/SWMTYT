@@ -28,7 +28,7 @@ def main():
     ap.add_argument("--break", dest="brk", type=float, required=True)
     ap.add_argument("--cycles", type=int, required=True)
     ap.add_argument("--theme", default="sage")
-    ap.add_argument("--music", default="assets/music.mp3")
+    ap.add_argument("--music", default="assets")
     ap.add_argument("--outdir", required=True)
     a = ap.parse_args()
 
@@ -40,7 +40,7 @@ def main():
     hours_words = hours_words.strip()
     adj = (f"{h}-hour" if h else "") + (f" {m}-minute" if m else "")
     adj = adj.strip()
-    has_music = os.path.exists(a.music)
+    has_music = bool(g.find_music(a.music))
     theme = NAMES.get(a.theme, "Soft Sage")
 
     chapters, _ = g.build_chapters(round(a.focus * 60), round(a.brk * 60), N, a.focus, a.brk)
